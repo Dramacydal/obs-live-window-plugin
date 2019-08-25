@@ -2,6 +2,7 @@
 #include <util/dstr.h>
 #include <obs-frontend-api.h>
 #include <obs-scene.h>
+#include <Dwmapi.h>
 #include "dc-capture.h"
 #include "window-helpers.h"
 
@@ -13,6 +14,7 @@
 #define TEXT_MATCH_TITLE    obs_module_text("LiveWindowCapture.Priority.Title")
 #define TEXT_MATCH_CLASS    obs_module_text("LiveWindowCapture.Priority.Class")
 #define TEXT_MATCH_EXE      obs_module_text("LiveWindowCapture.Priority.Exe")
+#define TEXT_CAPTURE_BORDER obs_module_text("LiveCaptureBorder")
 #define TEXT_CAPTURE_CURSOR obs_module_text("LiveCaptureCursor")
 #define TEXT_COMPATIBILITY  obs_module_text("LiveCompatibility")
 
@@ -25,6 +27,7 @@ struct live_window_capture {
 	char *class;
 	char *executable;
 	enum window_priority priority;
+	bool border;
 	bool cursor;
 	bool compatibility;
 	bool use_wildcards; /* TODO */
@@ -62,6 +65,7 @@ static void update_settings(struct live_window_capture *wc, obs_data_t *s)
 	}
 
 	wc->priority = (enum window_priority)priority;
+	wc->border = obs_data_get_bool(s, "border");
 	wc->cursor = obs_data_get_bool(s, "cursor");
 	wc->use_wildcards = obs_data_get_bool(s, "use_wildcards");
 	wc->compatibility = obs_data_get_bool(s, "compatibility");
@@ -126,6 +130,7 @@ static uint32_t live_wc_height(void *data)
 
 static void live_wc_defaults(obs_data_t *defaults)
 {
+	obs_data_set_default_bool(defaults, "border", false);
 	obs_data_set_default_bool(defaults, "cursor", true);
 	obs_data_set_default_bool(defaults, "compatibility", false);
 }
@@ -148,6 +153,7 @@ static obs_properties_t *live_wc_properties(void *unused)
 	obs_property_list_add_int(p, TEXT_MATCH_CLASS, WINDOW_PRIORITY_CLASS);
 	obs_property_list_add_int(p, TEXT_MATCH_EXE, WINDOW_PRIORITY_EXE);
 
+	obs_properties_add_bool(ppts, "border", TEXT_CAPTURE_BORDER);
 	obs_properties_add_bool(ppts, "cursor", TEXT_CAPTURE_CURSOR);
 
 	obs_properties_add_bool(ppts, "compatibility", TEXT_COMPATIBILITY);
@@ -199,6 +205,58 @@ bool reposition_shit_callback(obs_scene_t* scene, obs_sceneitem_t* item, void* p
 	return true;
 }
 
+struct PositionData
+{
+	struct live_window_capture* wc;
+	int counter;
+
+	struct obs_sceneitem_t* lastItem;
+	struct obs_sceneitem_t* currentItem;
+	int lastIndex;
+};
+
+bool moveontop_shit_callback(obs_scene_t* scene, obs_sceneitem_t* item, void* data)
+{
+	struct PositionData* posData = data;
+	if (strcmp(obs_source_get_display_name(item->source->info.id), TEXT_WINDOW_CAPTURE) != 0) {
+		++posData->counter;
+		return true;
+	}
+
+	posData->lastIndex = posData->counter;
+	posData->lastItem = item;
+
+	if (item->source == posData->wc->source)
+		posData->currentItem = item;
+
+	++posData->counter;
+
+	return true;
+}
+
+void moveOnTop(obs_scene_t* currentScene2, struct live_window_capture* wc)
+{
+	struct PositionData data;
+	data.lastItem = NULL;
+	data.lastIndex = -1;
+	data.wc = wc;
+	data.counter = 0;
+	data.currentItem = NULL;
+
+	obs_scene_enum_items(currentScene2, moveontop_shit_callback, &data);
+
+	if (data.currentItem != NULL && data.lastItem != data.currentItem)
+	{
+		obs_sceneitem_set_order_position(data.currentItem, data.lastIndex);
+
+		/*char c[1024];
+		memset(c, 0, sizeof(c));
+		sprintf(c, "%u", data.lastIndex);
+
+		MessageBoxA(NULL, c, "", 0);*/
+	}
+}
+
 void do_reposition_shit(struct live_window_capture* wc)
 {
 	obs_source_t* currentScene = obs_frontend_get_current_scene();
@@ -216,6 +274,11 @@ void do_reposition_shit(struct live_window_capture* wc)
 	param.wc = wc;
 
 	obs_scene_enum_items(currentScene2, reposition_shit_callback, &param);
+
+	HWND hwnd = GetForegroundWindow();
+	if (hwnd == wc->window)
+		moveOnTop(currentScene2, wc);
+
 	obs_source_release(currentScene);
 }
 
@@ -253,9 +316,13 @@ static void live_wc_tick(void *data, float seconds)
 		reset_capture = true;
 
 	} else if (IsIconic(wc->window)) {
+		if (wc->capture.valid)
+			dc_capture_free(&wc->capture);
 		return;
 	} else
 	{
+		if (!wc->capture.valid)
+			reset_capture = true;
 		do_reposition_shit(wc);
 	}
 
@@ -300,7 +367,19 @@ static void live_wc_tick(void *data, float seconds)
 		wc->resize_timer = 0.0f;
 		wc->last_rect = rect;
 		dc_capture_free(&wc->capture);
-		dc_capture_init(&wc->capture, 0, 0, rect.right, rect.bottom,
+
+		RECT realRect;
+
+		if (wc->border)
+		{
+			DwmGetWindowAttribute(wc->window, DWMWA_EXTENDED_FRAME_BOUNDS, &realRect, sizeof(realRect));
+			ScreenToClient(wc->window, &realRect.left);
+			ScreenToClient(wc->window, &realRect.right);
+		}
+		else
+			realRect = rect;
+
+		dc_capture_init(&wc->capture, realRect.left, realRect.top, realRect.right, realRect.bottom,
 				wc->cursor, wc->compatibility);
 	}
 
